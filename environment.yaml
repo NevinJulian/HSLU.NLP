@@ -1,0 +1,22 @@
+name: nlp_env
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.12
+  - ipykernel
+  - numpy
+  - pandas
+  - scipy
+  - matplotlib
+  - gensim
+  - pip
+  - pip:
+      - torch
+      - wandb
+      - wordcloud
+      - matplotlib-venn
+      - datasets
+      - huggingface_hub
+      - transformers
+      - nltk
