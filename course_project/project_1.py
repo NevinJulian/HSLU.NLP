@@ -757,7 +757,7 @@ train_dataset = CommonsenseQAEmbeddingDataset(
     wv,
     embedding_dim=300,
     cache_path='train_tfidf_embeddings.pkl',
-    use_tfidf=False
+    use_tfidf=True
 )
 
 valid_dataset = CommonsenseQAEmbeddingDataset(
@@ -765,7 +765,7 @@ valid_dataset = CommonsenseQAEmbeddingDataset(
     wv,
     embedding_dim=300,
     cache_path='valid_tfidf_embeddings.pkl',
-    use_tfidf=False
+    use_tfidf=True
 )
 
 class AugmentedEmbeddingDataset(torch.utils.data.Dataset):
@@ -1224,7 +1224,7 @@ class QARNNModel(nn.Module):
 wandb.login()
 
 
-# In[ ]:
+# In[29]:
 
 
 embedding_run = wandb.init(
@@ -1549,7 +1549,7 @@ print(f"Training complete! Best validation accuracy: {best_accuracy:.4f}")
 # 
 # This training approach was developed based on best practices for RNN training and refined through experimentation. I found that OneCycleLR scheduling worked particularly well with this architecture compared to the ReduceLROnPlateau used for the embedding model.
 
-# In[38]:
+# In[36]:
 
 
 embedding_dim = 300  # Same as word vectors
@@ -1571,7 +1571,7 @@ rnn_model = rnn_model.to(device)
 print(rnn_model)
 
 
-# In[39]:
+# In[37]:
 
 
 rnn_run = wandb.init(
@@ -1591,8 +1591,10 @@ rnn_run = wandb.init(
   reinit=True,
 )
 
+wandb.watch(rnn_model, log="all")
 
-# In[40]:
+
+# In[38]:
 
 
 # Loss function - standard cross entropy
@@ -1620,19 +1622,20 @@ scheduler = OneCycleLR(
 )
 
 
-# In[41]:
+# In[39]:
 
 
 checkpoints_path = "./checkpoints/rnn_model"
 os.makedirs(checkpoints_path, exist_ok=True)
 
 
-# In[48]:
+# In[40]:
 
 
-def train_rnn_model(model, criterion, optimizer, scheduler, train_loader, valid_loader, num_epochs, device, checkpoints_path=None):
-    """Training function for RNN model"""
+def train_rnn_model(model, criterion, optimizer, scheduler, train_loader, valid_loader, num_epochs, device, checkpoints_path=None, log_wandb=True, gradient_clip_val=1.0):
+    """Training function for RNN model that matches the embedding model format"""
     best_val_accuracy = 0.0
+    training_start_time = time.time()
     
     for epoch in range(num_epochs):
         print(f"\nEpoch {epoch+1}/{num_epochs}")
@@ -1643,32 +1646,41 @@ def train_rnn_model(model, criterion, optimizer, scheduler, train_loader, valid_
         train_correct = 0
         train_total = 0
         
-        for padded_sequences, sequence_lengths, indices, answers in train_loader:
-            # Move to device
-            padded_sequences = padded_sequences.to(device)
-            sequence_lengths = sequence_lengths.to(device)
-            indices = indices.to(device)
-            answers = answers.to(device)
-            
-            # Forward pass
-            optimizer.zero_grad()
-            outputs = model(padded_sequences, sequence_lengths, indices)
-            loss = criterion(outputs, answers)
-            
-            # Backward pass
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            optimizer.step()
-            if scheduler is not None:
-                scheduler.step()
-            
-            # Statistics
-            train_loss += loss.item()
-            _, predicted = torch.max(outputs, 1)
-            train_total += answers.size(0)
-            train_correct += (predicted == answers).sum().item()
-            
-            print(f"Batch - Loss: {loss.item():.4f}, Acc: {(predicted == answers).sum().item()/answers.size(0):.4f}", end='\r')
+        with tqdm(train_loader, desc="Training") as progress_bar:
+            for batch_data in progress_bar:
+                # Unpack the batch data
+                padded_sequences, sequence_lengths, indices, answers = batch_data
+                
+                # Move to device
+                padded_sequences = padded_sequences.to(device)
+                sequence_lengths = sequence_lengths.to(device)
+                indices = indices.to(device)
+                answers = answers.to(device)
+                
+                # Forward pass
+                optimizer.zero_grad()
+                outputs = model(padded_sequences, sequence_lengths, indices)
+                loss = criterion(outputs, answers)
+                
+                # Backward pass
+                loss.backward()
+                if gradient_clip_val > 0:
+                    nn.utils.clip_grad_norm_(model.parameters(), gradient_clip_val)
+                optimizer.step()
+                if scheduler is not None:
+                    scheduler.step()
+                
+                # Statistics
+                train_loss += loss.item()
+                _, predicted = torch.max(outputs, 1)
+                train_total += answers.size(0)
+                train_correct += (predicted == answers).sum().item()
+                
+                # Update progress bar
+                progress_bar.set_postfix({
+                    'loss': f"{loss.item():.4f}",
+                    'acc': f"{train_correct/train_total:.4f}"
+                })
         
         train_accuracy = train_correct / train_total
         avg_train_loss = train_loss / len(train_loader)
@@ -1680,7 +1692,10 @@ def train_rnn_model(model, criterion, optimizer, scheduler, train_loader, valid_
         val_total = 0
         
         with torch.no_grad():
-            for padded_sequences, sequence_lengths, indices, answers in valid_loader:
+            for batch_data in tqdm(valid_loader, desc="Validation"):
+                # Unpack the batch data
+                padded_sequences, sequence_lengths, indices, answers = batch_data
+                
                 # Move to device
                 padded_sequences = padded_sequences.to(device)
                 sequence_lengths = sequence_lengths.to(device)
@@ -1700,21 +1715,40 @@ def train_rnn_model(model, criterion, optimizer, scheduler, train_loader, valid_
         val_accuracy = val_correct / val_total
         avg_val_loss = val_loss / len(valid_loader)
         
-        # Print metrics
-        print(f"Train Loss: {avg_train_loss:.4f}, Train Acc: {train_accuracy:.4f}")
-        print(f"Val Loss: {avg_val_loss:.4f}, Val Acc: {val_accuracy:.4f}")
-        
         # Save best model
         if val_accuracy > best_val_accuracy:
             print(f"Validation accuracy improved from {best_val_accuracy:.4f} to {val_accuracy:.4f}")
             best_val_accuracy = val_accuracy
-            save_path = os.path.join(checkpoints_path, "best_rnn_model.pt")
-            torch.save(model.state_dict(), save_path)
+            save_checkpoint(model, optimizer, epoch, scheduler, 
+                          checkpoints_path, "best_rnn_model", val_accuracy)
+        
+        # Print metrics
+        print(f"Train Loss: {avg_train_loss:.4f}, Train Acc: {train_accuracy:.4f}")
+        print(f"Val Loss: {avg_val_loss:.4f}, Val Acc: {val_accuracy:.4f}")
+        
+        # Log to wandb
+        if log_wandb:
+            wandb.log({
+                "epoch": epoch,
+                "train_loss": avg_train_loss,
+                "train_accuracy": train_accuracy,
+                "val_loss": avg_val_loss,
+                "val_accuracy": val_accuracy,
+                "learning_rate": optimizer.param_groups[0]['lr']
+            })
     
-    return best_val_accuracy
+    print(f"Training completed in {(time.time() - training_start_time)/60:.2f} minutes")
+    print(f"Best validation accuracy: {best_val_accuracy:.4f}")
+    
+    # Final metrics for wandb
+    if log_wandb:
+        wandb.run.summary["best_val_accuracy"] = best_val_accuracy
+        wandb.finish()
+    
+    return model, best_val_accuracy
 
 
-# In[49]:
+# In[41]:
 
 
 def check_rnn_model():
@@ -1796,7 +1830,7 @@ except Exception as e:
 # 
 # During experimentation, I found the RNN model more prone to overfitting than the embedding model, hence the slightly higher regularization through dropout. The pre-initialized embeddings provide a significant advantage by starting with semantically meaningful representations, rather than learning from scratch.
 
-# In[50]:
+# In[42]:
 
 
 print("Starting RNN model training...")
@@ -1806,11 +1840,12 @@ trained_rnn_model, best_rnn_accuracy = train_rnn_model(  # Updated name
     criterion, 
     optimizer, 
     scheduler, 
-    train_loader, 
-    valid_loader, 
+    train_rnn_loader, 
+    valid_rnn_loader, 
     num_epochs,
     device,
-    checkpoints_path
+    checkpoints_path,
+    gradient_clip_val=1.0 
 )
 
 print(f"RNN Training complete! Best validation accuracy: {best_rnn_accuracy:.4f}")
