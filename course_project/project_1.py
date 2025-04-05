@@ -1853,65 +1853,487 @@ print(f"RNN Training complete! Best validation accuracy: {best_rnn_accuracy:.4f}
 
 # # Evaluation
 
-# ## Loading and Evaluating Best Models
+# ### Checkpoint Loading
 # 
-# I'm loading the best checkpoint for each model type based on validation performance. This ensures we evaluate the models at their optimal performance points, not just at the end of training which might include some overfitting.
+# We begin by loading the trained model checkpoints for both models. This step is crucial for a fair evaluation because:
 # 
-# For each model, I:
-# 1. Load the checkpoint with the highest validation accuracy
-# 2. Reconstruct the model architecture with the same hyperparameters
-# 3. Initialize embedding matrices appropriately (especially for the RNN model)
-# 4. Move the model to the appropriate device for inference
+# - It retrieves our best performing models from saved checkpoints
+# - It ensures we're evaluating the models at their peak performance
+# - It handles the transition from training to evaluation mode
 # 
-# This approach allows fair comparison between the models based on their best-performing configurations. I experimented with ensemble methods (combining predictions from multiple checkpoints) but found the single best model performed similarly while being simpler to implement and evaluate.
+# The checkpoint loading function handles various checkpoint formats and properly restores the model's state dictionary. We load both the embedding model (QASimpleClassifier) and RNN model (QARNNModel) with their respective architecture and hyperparameters.
 
-# ## Comprehensive Model Evaluation
-# 
-# For thorough evaluation, I'm implementing functions that:
-# 
-# 1. **Compute overall metrics**:
-#    - Accuracy (primary metric for multi-class classification)
-#    - Confusion matrix (shows patterns in model predictions)
-#    - Classification report (precision, recall, F1 per class)
-# 
-# 2. **Enable error analysis**:
-#    - Track individual prediction errors
-#    - Include information about confidence levels
-#    - Preserve context (questions and all answer choices)
-# 
-# 3. **Support qualitative assessment**:
-#    - Identify common error patterns
-#    - Compare errors between models
-#    - Assess model confidence calibration
-# 
-# This comprehensive evaluation approach goes beyond simple accuracy numbers to understand the models' strengths and weaknesses. After experimenting with various evaluation metrics, I found accuracy most appropriate for this balanced, multi-class task, supplemented by qualitative analysis of error patterns.
+# In[43]:
 
-# ## Detailed Error Analysis
+
+def load_checkpoint(model, checkpoint_path):
+    """Load model checkpoint and return both model and training epoch"""
+    checkpoint = torch.load(checkpoint_path)
+    model.load_state_dict(checkpoint["model_state_dict"])
+    return model, checkpoint["epoch"]
+
+# Load embedding model checkpoint
+checkpoints_path_qa = "./checkpoints/qa_model"
+best_embedding_checkpoint_path = os.path.join(checkpoints_path_qa, "best_model.pt")
+embedding_model = QASimpleClassifier(
+    embedding_dim=300,
+    hidden_dim=64,
+    dropout_rate=0.2
+).to(device)
+embedding_model, best_embedding_epoch = load_checkpoint(embedding_model, best_embedding_checkpoint_path)
+embedding_model.eval()  # Set to evaluation mode
+print(f"Loaded embedding model checkpoint from epoch {best_embedding_epoch}")
+
+# Load RNN model checkpoint
+checkpoints_path_rnn = "./checkpoints/rnn_model"
+best_rnn_checkpoint_path = os.path.join(checkpoints_path_rnn, "best_rnn_model.pt")
+rnn_model = QARNNModel(
+    embedding_dim=300,
+    hidden_dim=128,
+    dropout_rate=0.2
+).to(device)
+rnn_model, best_rnn_epoch = load_checkpoint(rnn_model, best_rnn_checkpoint_path)
+rnn_model.eval()  # Set to evaluation mode
+print(f"Loaded RNN model checkpoint from epoch {best_rnn_epoch}")
+
+
+# ### Test Dataset Creation
 # 
-# To understand where and why my models fail, I'm conducting detailed error analysis by:
+# Creating proper test datasets ensures a fair comparison between models. This step:
 # 
-# 1. **Examining specific examples** where models make incorrect predictions:
-#    - Questions with particular linguistic features
-#    - Questions requiring specific types of reasoning
-#    - Answer choices with similar semantic content
+# - Creates identical test data for both model architectures
+# - Processes the data in model-appropriate formats
+# - Configures larger batch sizes to speed up evaluation
 # 
-# 2. **Categorizing error patterns** according to:
-#    - Question type (what, which, who, etc.)
-#    - Required reasoning type (spatial, temporal, causal, etc.)
-#    - Model confidence (high confidence errors vs. uncertain predictions)
+# Each model requires a different dataset implementation - the embedding model uses normalized fixed-length vectors, while the RNN model processes sequences with our custom collation function. Both datasets access the same underlying test examples, ensuring consistent evaluation.
+
+# In[44]:
+
+
+# Create embedding test dataset and loader
+embedding_test_dataset = CommonsenseQAEmbeddingDataset(
+    test, 
+    wv,
+    embedding_dim=300,
+    cache_path='test_embeddings.pkl',
+    use_tfidf=True
+)
+normalized_test_dataset = NormalizedEmbeddingDataset(embedding_test_dataset)
+
+embedding_test_loader = DataLoader(
+    normalized_test_dataset,
+    batch_size=1024,  # Larger batch size for testing
+    shuffle=False,
+    num_workers=4,
+    pin_memory=True
+)
+
+# Create RNN test dataset and loader
+rnn_test_dataset = CommonsenseQARNNDataset(
+    test, 
+    wv,
+    embedding_dim=300
+)
+
+rnn_test_loader = DataLoader(
+    rnn_test_dataset,
+    batch_size=256,  # Adjust based on memory constraints
+    shuffle=False,
+    collate_fn=rnn_collate_batch,
+    num_workers=4,
+    pin_memory=True
+)
+
+print(f"Created test loaders - Embedding: {len(embedding_test_loader)} batches, RNN: {len(rnn_test_loader)} batches")
+
+
+# ### Evaluation Function Implementation
 # 
-# 3. **Comparing error patterns between models** to identify:
-#    - Common weaknesses across architectures
-#    - Complementary strengths that could be leveraged in ensemble approaches
-#    - Potential improvements for future models
+# Our comprehensive evaluation function calculates multiple metrics beyond simple accuracy. Key features include:
 # 
-# This analysis revealed several important patterns:
-# - Both models struggle with questions requiring multi-hop reasoning
-# - The embedding model has difficulty with questions involving negation or contradiction
-# - The RNN model performs better on questions requiring understanding word order and relationships
-# - Both models sometimes fixate on semantic similarity rather than logical correctness
+# - **Multiple metrics**: Accuracy, precision, recall, and F1 score for each class
+# - **Flexible processing**: Handles different input formats for each model type
+# - **Efficient batching**: Processes test data in large batches for faster evaluation
+# - **Result collection**: Saves all predictions and outputs for detailed analysis
 # 
-# These insights provide direction for future improvements beyond simple architecture changes.
+# Using multiple metrics provides a more nuanced understanding of model performance, particularly for imbalanced classes. The function efficiently moves data to the appropriate device (CPU/GPU) and handles the forward pass through each model type.
+
+# In[52]:
+
+
+from sklearn.metrics import accuracy_score, precision_recall_fscore_support, classification_report
+
+def evaluate_model(model, test_loader, model_type="embedding"):
+    """Evaluate model performance using sklearn metrics"""
+    model.eval()
+    device = next(model.parameters()).device
+    
+    all_predictions = []
+    all_labels = []
+    all_outputs = []
+    
+    with torch.no_grad():
+        for batch in tqdm(test_loader, desc=f"Evaluating {model_type} model"):
+            # Handle different batch formats for each model type
+            if model_type == "embedding":
+                question_batch, choices_batch, answers = batch
+                question_batch = question_batch.to(device)
+                choices_batch = choices_batch.to(device)
+                answers = answers.to(device)
+                outputs = model(question_batch, choices_batch)
+            else:  # RNN model
+                padded_sequences, sequence_lengths, indices, answers = batch
+                padded_sequences = padded_sequences.to(device)
+                sequence_lengths = sequence_lengths.to(device)
+                indices = indices.to(device)
+                answers = answers.to(device)
+                outputs = model(padded_sequences, sequence_lengths, indices)
+            
+            # Get predictions
+            predictions = torch.argmax(outputs, dim=1)
+            
+            # Store predictions and labels
+            all_predictions.extend(predictions.cpu().numpy())
+            all_labels.extend(answers.cpu().numpy())
+            all_outputs.append(outputs.cpu().detach())
+    
+    # Calculate metrics using sklearn
+    accuracy = accuracy_score(all_labels, all_predictions)
+    precision, recall, f1, _ = precision_recall_fscore_support(
+        all_labels, all_predictions, average=None, zero_division=0
+    )
+    macro_precision, macro_recall, macro_f1, _ = precision_recall_fscore_support(
+        all_labels, all_predictions, average='macro', zero_division=0
+    )
+    
+    # Create metrics dictionary
+    metrics_dict = {
+        "accuracy": accuracy,
+        "precision": precision.tolist(),
+        "recall": recall.tolist(),
+        "f1": f1.tolist(),
+        "macro_precision": macro_precision,
+        "macro_recall": macro_recall,
+        "macro_f1": macro_f1
+    }
+    
+    return metrics_dict, all_predictions, all_labels, torch.cat(all_outputs) if all_outputs else None
+
+
+# ### Basic Metrics Comparison
+# 
+# This analysis provides a direct head-to-head comparison of model performance. We compute:
+# 
+# - **Overall accuracy**: The percentage of examples where each model selects the correct answer
+# - **Performance gap**: The difference in accuracy between models
+# - **Detailed metrics**: Precision, recall, and F1 scores for a more nuanced comparison
+# 
+# These core metrics give us a high-level understanding of how our models perform on the commonsense reasoning task. The comparison shows which approach (embedding-based or sequence-based) better captures commonsense knowledge, and by what margin.
+
+# In[53]:
+
+
+from sklearn.metrics import classification_report, confusion_matrix
+
+# Evaluate embedding model
+embedding_metrics, embedding_predictions, embedding_labels, embedding_outputs = evaluate_model(
+    embedding_model, embedding_test_loader, "embedding"
+)
+
+# Evaluate RNN model
+rnn_metrics, rnn_predictions, rnn_labels, rnn_outputs = evaluate_model(
+    rnn_model, rnn_test_loader, "rnn"
+)
+
+print("\n===== MODEL PERFORMANCE COMPARISON =====")
+print(f"Embedding Model Test Accuracy: {embedding_metrics['accuracy']:.4f}")
+print(f"RNN Model Test Accuracy: {rnn_metrics['accuracy']:.4f}")
+print(f"Difference: {abs(embedding_metrics['accuracy'] - rnn_metrics['accuracy']):.4f} in favor of the "
+      f"{'Embedding' if embedding_metrics['accuracy'] > rnn_metrics['accuracy'] else 'RNN'} model")
+
+print("\n===== DETAILED METRICS =====")
+print(f"Embedding Model - Macro Precision: {embedding_metrics['macro_precision']:.4f}, "
+      f"Macro Recall: {embedding_metrics['macro_recall']:.4f}, "
+      f"Macro F1: {embedding_metrics['macro_f1']:.4f}")
+print(f"RNN Model - Macro Precision: {rnn_metrics['macro_precision']:.4f}, "
+      f"Macro Recall: {rnn_metrics['macro_recall']:.4f}, "
+      f"Macro F1: {rnn_metrics['macro_f1']:.4f}")
+
+
+# ### Model Agreement Analysis
+# 
+# This analysis examines how frequently both models make the same prediction, regardless of correctness. It reveals:
+# 
+# - **Convergent thinking**: How often models reach the same conclusion
+# - **Diversity of approach**: Whether models learn different reasoning strategies
+# - **Ensemble potential**: Low agreement suggests models might complement each other
+# 
+# Agreement analysis provides insight into whether the models are solving the task in similar ways. High disagreement with similar accuracy suggests the models have learned different, equally effective reasoning strategies, while high agreement indicates they've converged on similar approaches.
+
+# In[54]:
+
+
+# Calculate agreement percentage
+agreements = np.sum(np.array(embedding_predictions) == np.array(rnn_predictions))
+agreement_percentage = agreements / len(embedding_predictions) * 100
+
+print("\n===== MODEL AGREEMENT ANALYSIS =====")
+print(f"Models agree on {agreements} out of {len(embedding_predictions)} examples ({agreement_percentage:.2f}%)")
+
+# Create label mapping for readable output
+label_mapping = {i: chr(65 + i) for i in range(5)}  # 0->A, 1->B, etc.
+label_names = list(label_mapping.values())
+
+
+# ### Classification Reports and Confusion Matrices
+# 
+# These detailed visualizations and metrics break down performance by answer choice (A through E):
+# 
+# - **Per-class metrics**: Precision, recall, and F1 score for each answer option
+# - **Error patterns**: Confusion matrices visually show which classes get confused with others
+# - **Systematic biases**: Reveals if certain answer choices are consistently predicted correctly or incorrectly
+# 
+# Confusion matrices are particularly valuable because they show not just when models make mistakes, but what kind of mistakes they make. This helps identify if there are systematic biases in how each model approaches different answer types.
+
+# In[55]:
+
+
+# Classification reports
+print("\n===== CLASSIFICATION REPORTS =====")
+print("\nEmbedding Model Classification Report:")
+print(classification_report(embedding_labels, embedding_predictions, target_names=label_names, zero_division=0))
+
+print("\nRNN Model Classification Report:")
+print(classification_report(rnn_labels, rnn_predictions, target_names=label_names, zero_division=0))
+
+# Confusion matrices
+embedding_cm = confusion_matrix(embedding_labels, embedding_predictions)
+rnn_cm = confusion_matrix(rnn_labels, rnn_predictions)
+
+plt.figure(figsize=(16, 7))
+
+plt.subplot(1, 2, 1)
+sns.heatmap(embedding_cm, annot=True, fmt="d", cmap="Blues", xticklabels=label_names, yticklabels=label_names)
+plt.title("Embedding Model Confusion Matrix")
+plt.xlabel("Predicted")
+plt.ylabel("True")
+
+plt.subplot(1, 2, 2)
+sns.heatmap(rnn_cm, annot=True, fmt="d", cmap="Blues", xticklabels=label_names, yticklabels=label_names)
+plt.title("RNN Model Confusion Matrix")
+plt.xlabel("Predicted")
+plt.ylabel("True")
+
+plt.tight_layout()
+plt.savefig('confusion_matrices.png')
+plt.show()
+
+
+# ### Example-Based Analysis
+# 
+# This qualitative analysis examines specific examples where models disagree, providing concrete insights:
+# 
+# - **Real examples**: Shows actual questions and choices from the test set
+# - **Prediction differences**: Highlights where and how models diverge in their reasoning
+# - **Error patterns**: Helps identify the types of questions that challenge each model
+# 
+# By examining real examples, we move beyond abstract metrics to understand practical differences in model behavior. These examples provide intuition about each model's strengths and weaknesses that purely quantitative analysis might miss.
+
+# In[57]:
+
+
+# Create label mapping for readable output
+label_mapping = {i: chr(65 + i) for i in range(5)}  # 0->A, 1->B, etc.
+
+# Find examples where models disagree
+disagreement_indices = np.where(np.array(embedding_predictions) != np.array(rnn_predictions))[0]
+print(f"\n===== MODEL DISAGREEMENTS =====")
+print(f"Models disagree on {len(disagreement_indices)} examples ({len(disagreement_indices)/len(embedding_predictions)*100:.2f}%)")
+
+# Show 5 examples of disagreements
+print("\nExamples where models disagree:")
+np.random.seed(42)  # For reproducibility
+sample_indices = np.random.choice(disagreement_indices, min(5, len(disagreement_indices)), replace=False)
+
+for i in sample_indices:
+    # Convert numpy.int64 to Python int for indexing into the dataset
+    idx = int(i)
+    example = test[idx]
+    print(f"\nQuestion: {example['question']}")
+    for j, choice in enumerate(example["choices"]["text"]):
+        print(f"{chr(65+j)}) {choice}")
+    print(f"True Answer: {example['answerKey']}")
+    print(f"Embedding Model Prediction: {label_mapping[embedding_predictions[idx]]}")
+    print(f"RNN Model Prediction: {label_mapping[rnn_predictions[idx]]}")
+    print("-" * 80)
+
+
+# ### Correctness Pattern Analysis
+# 
+# This analysis categorizes test examples into four groups:
+#   
+# - **Only embedding model correct**: Cases where the embedding approach succeeds but RNN fails
+# - **Only RNN model correct**: Cases where the RNN approach succeeds but embedding fails
+# - **Both models correct**: Cases where both models succeed
+# - **Both models incorrect**: Cases where both models fail
+# 
+# These patterns quantify model complementarity - how often one model succeeds where the other fails. High complementarity suggests that combining models could yield better performance than either model alone, while low complementarity indicates models have similar strengths and weaknesses.
+
+# In[58]:
+
+
+# Calculate correctness patterns
+embedding_correct = np.array(embedding_predictions) == np.array(embedding_labels)
+rnn_correct = np.array(rnn_predictions) == np.array(rnn_labels)
+
+only_embedding_correct = np.logical_and(embedding_correct, np.logical_not(rnn_correct))
+only_rnn_correct = np.logical_and(rnn_correct, np.logical_not(embedding_correct))
+both_correct = np.logical_and(embedding_correct, rnn_correct)
+both_incorrect = np.logical_and(np.logical_not(embedding_correct), np.logical_not(rnn_correct))
+
+print("\n===== CORRECTNESS PATTERNS =====")
+print(f"Only Embedding Model Correct: {np.sum(only_embedding_correct)} examples ({np.sum(only_embedding_correct)/len(embedding_predictions)*100:.2f}%)")
+print(f"Only RNN Model Correct: {np.sum(only_rnn_correct)} examples ({np.sum(only_rnn_correct)/len(embedding_predictions)*100:.2f}%)")
+print(f"Both Models Correct: {np.sum(both_correct)} examples ({np.sum(both_correct)/len(embedding_predictions)*100:.2f}%)")
+print(f"Both Models Incorrect: {np.sum(both_incorrect)} examples ({np.sum(both_incorrect)/len(embedding_predictions)*100:.2f}%)")
+
+# Visualize correctness patterns
+plt.figure(figsize=(10, 6))
+categories = ['Only Embedding\nCorrect', 'Only RNN\nCorrect', 'Both\nCorrect', 'Both\nIncorrect']
+values = [np.sum(only_embedding_correct), np.sum(only_rnn_correct), np.sum(both_correct), np.sum(both_incorrect)]
+
+plt.bar(categories, values, color=['blue', 'orange', 'green', 'red'])
+plt.ylabel('Number of Examples')
+plt.title('Model Correctness Patterns')
+plt.grid(axis='y', linestyle='--', alpha=0.7)
+
+# Add percentage labels
+for i, v in enumerate(values):
+    plt.text(i, v + 5, f"{v/len(embedding_predictions)*100:.1f}%", ha='center')
+    
+plt.tight_layout()
+plt.savefig('correctness_patterns.png')
+plt.show()
+
+
+# ### Question Type Analysis
+# 
+# This advanced analysis breaks down performance by question type (what, which, who, etc.):
+# 
+# - **Type-specific performance**: Shows how models perform on different question categories
+# - **Comparative strengths**: Identifies whether certain models excel at particular question types
+# - **Distribution awareness**: Accounts for the frequency of different question types in the test set
+# 
+# Understanding performance by question type provides actionable insights for model improvement. It can reveal whether certain question structures favor particular architectures, helping guide future development efforts toward addressing specific weaknesses.
+
+# In[59]:
+
+
+# Performance by question type
+print("\n===== PERFORMANCE BY QUESTION TYPE =====")
+question_types = []
+for idx in range(len(test)):
+    question_type = get_question_type(test[idx]['question'])
+    question_types.append(question_type)
+
+question_types = np.array(question_types)
+unique_types = np.unique(question_types)
+
+embedding_by_type = []
+rnn_by_type = []
+
+for q_type in unique_types:
+    type_indices = question_types == q_type
+    if np.sum(type_indices) > 0:
+        embedding_accuracy = np.mean(embedding_correct[type_indices])
+        rnn_accuracy = np.mean(rnn_correct[type_indices])
+        
+        embedding_by_type.append(embedding_accuracy)
+        rnn_by_type.append(rnn_accuracy)
+        
+        print(f"Question type '{q_type}':")
+        print(f"  Count: {np.sum(type_indices)}")
+        print(f"  Embedding Accuracy: {embedding_accuracy:.4f}")
+        print(f"  RNN Accuracy: {rnn_accuracy:.4f}")
+        print(f"  Difference: {abs(embedding_accuracy - rnn_accuracy):.4f} in favor of " 
+              f"{'Embedding' if embedding_accuracy > rnn_accuracy else 'RNN'} model")
+
+# Visualize performance by question type
+plt.figure(figsize=(12, 6))
+x = np.arange(len(unique_types))
+width = 0.35
+
+plt.bar(x - width/2, embedding_by_type, width, label='Embedding Model')
+plt.bar(x + width/2, rnn_by_type, width, label='RNN Model')
+
+plt.xlabel('Question Type')
+plt.ylabel('Accuracy')
+plt.title('Model Performance by Question Type')
+plt.xticks(x, unique_types)
+plt.ylim(0, 1.0)
+plt.legend()
+plt.grid(axis='y', linestyle='--', alpha=0.7)
+
+plt.tight_layout()
+plt.savefig('performance_by_question_type.png')
+plt.show()
+
+
+# ### Summary and Ensemble Potential
+# 
+# Our final analysis explores the potential benefits of combining models:
+# 
+# - **Overall comparison**: Summarizes key findings about model performance
+# - **Complementarity assessment**: Quantifies how often models have complementary strengths
+# - **Ensemble ceiling**: Calculates the theoretical maximum performance for a perfect ensemble
+# 
+# This summary helps determine whether ensemble methods would be worth pursuing. When models show high complementarity (frequently succeeding on different examples), an ensemble approach could significantly outperform either individual model. The analysis provides an upper bound on potential ensemble performance.
+
+# In[60]:
+
+
+# Calculate potential ensemble performance
+# Using a simple majority voting approach
+print("\n===== ENSEMBLE POTENTIAL =====")
+
+# Basic voting ensemble (choose prediction from better-performing model in case of disagreement)
+better_model = "embedding" if embedding_metrics['accuracy'] > rnn_metrics['accuracy'] else "rnn"
+
+ensemble_predictions = []
+for i in range(len(embedding_predictions)):
+    if embedding_predictions[i] == rnn_predictions[i]:
+        ensemble_predictions.append(embedding_predictions[i])
+    else:
+        # In case of disagreement, trust the better overall model
+        if better_model == "embedding":
+            ensemble_predictions.append(embedding_predictions[i])
+        else:
+            ensemble_predictions.append(rnn_predictions[i])
+
+ensemble_correct = np.sum(np.array(ensemble_predictions) == np.array(embedding_labels)) / len(embedding_labels)
+
+print(f"Simple Ensemble Accuracy: {ensemble_correct:.4f}")
+print(f"Embedding Model Accuracy: {embedding_metrics['accuracy']:.4f}")
+print(f"RNN Model Accuracy: {rnn_metrics['accuracy']:.4f}")
+
+print("\nComplementarity Analysis:")
+complementary_idx = np.where(only_embedding_correct | only_rnn_correct)[0]
+complementary_percent = len(complementary_idx) / len(embedding_predictions) * 100
+print(f"Examples where exactly one model is correct: {len(complementary_idx)} ({complementary_percent:.2f}%)")
+print(f"This represents the maximum potential improvement from an ideal ensemble approach.")
+
+# Save summary to file
+with open("model_evaluation_summary.txt", "w") as f:
+    f.write("===== COMMONSENSE QA MODEL EVALUATION SUMMARY =====\n\n")
+    f.write(f"Embedding Model Accuracy: {embedding_metrics['accuracy']:.4f}\n")
+    f.write(f"RNN Model Accuracy: {rnn_metrics['accuracy']:.4f}\n")
+    f.write(f"Model Agreement: {agreement_percentage:.2f}%\n")
+    f.write(f"Examples where models complement each other: {complementary_percent:.2f}%\n\n")
+    f.write("Key Findings:\n")
+    f.write(f"1. The {'Embedding' if embedding_metrics['accuracy'] > rnn_metrics['accuracy'] else 'RNN'} model performed better overall\n")
+    f.write(f"2. The models disagree on {len(disagreement_indices)/len(embedding_predictions)*100:.2f}% of examples\n")
+    f.write(f"3. A perfect ensemble could potentially achieve up to {both_correct.sum()/len(embedding_predictions)*100 + complementary_percent:.2f}% accuracy\n")
+
 
 # # Conclusion
 
@@ -1944,3 +2366,5 @@ print(f"RNN Training complete! Best validation accuracy: {best_rnn_accuracy:.4f}
 #    - GitHub Copilot for code suggestions and documentation
 # 
 # This toolkit provided the necessary components for building, training, and evaluating models for the CommonsenseQA task while enabling detailed analysis and documentation of the project workflow.
+
+# 
