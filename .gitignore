@@ -2,6 +2,9 @@
 **/wandb/*
 .ipynb_checkpoints/
 
+**/hyperopt_checkpoints/*
+**/hyperopt_results/*
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]

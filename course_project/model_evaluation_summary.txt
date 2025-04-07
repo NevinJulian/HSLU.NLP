@@ -1,11 +1,11 @@
 ===== COMMONSENSE QA MODEL EVALUATION SUMMARY =====
 
-Embedding Model Accuracy: 0.2326
-RNN Model Accuracy: 0.2277
-Model Agreement: 33.42%
-Examples where models complement each other: 27.19%
+Embedding Model Accuracy: 0.2359
+RNN Model Accuracy: 0.2457
+Model Agreement: 32.60%
+Examples where models complement each other: 30.47%
 
 Key Findings:
-1. The Embedding model performed better overall
-2. The models disagree on 66.58% of examples
-3. A perfect ensemble could potentially achieve up to 36.61% accuracy
+1. The RNN model performed better overall
+2. The models disagree on 67.40% of examples
+3. A perfect ensemble could potentially achieve up to 39.31% accuracy
